@@ -402,6 +402,7 @@ class BenQProjector(ABC):
         """
         Reads the current status of the projector in a loop
         """
+        logger.debug("Corouting")
         previous_data = {}
 
         while True:
@@ -792,6 +793,7 @@ class BenQProjector(ABC):
         """
         Update the current power state.
         """
+        logger.debug('Next attempt to check power')
         response = await self.send_command(CMD_POWER)
         if response is None:
             if self.power_status == self.POWERSTATUS_POWERINGON:
@@ -864,6 +866,7 @@ class BenQProjector(ABC):
 
         This takes quite a lot of time.
         """
+        logger.debug("Running Update")
         if not await self.update_power():
             return False
 
