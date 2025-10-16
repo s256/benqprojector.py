@@ -436,8 +436,7 @@ class BenQProjector(ABC):
     async def _read_coroutine(self):
         """
         Reads the current status of the projector in a loop
-        """
-        logger.debug("Corouting")
+        """      
         previous_data = {}
 
         while True:
@@ -957,7 +956,6 @@ class BenQProjector(ABC):
 
         This takes quite a lot of time.
         """
-        logger.debug("Running Update")
         if not await self.update_power():
             return False
 
@@ -1091,7 +1089,7 @@ class BenQProjector(ABC):
                 self.power_status == self.POWERSTATUS_POWERINGON
                 and (time.time() - self._power_timestamp) <= self._poweron_time
             ):
-                logger.debug("Projector still powering on 3")
+                logger.debug("Projector still powering on")
             else:
                 logger.debug("Projector already on")
                 self.power_status = self.POWERSTATUS_ON
