@@ -174,7 +174,9 @@ class BenQConnection(ABC):
         Read data until separator is found.
         """
         if self._reader.at_eof():
-            return b""
+            logger.debug("Reader at EOF, connection may be lost")
+            await self.close()
+            raise BenQConnectionError("Connection lost: Reader at EOF")
 
         try:
             response = await asyncio.wait_for(
@@ -188,15 +190,19 @@ class BenQConnection(ABC):
         except asyncio.exceptions.TimeoutError:
             return b""
         except asyncio.IncompleteReadError as ex:
-            logger.exception("Incomplete read")
+            logger.debug("Incomplete read, connection may be lost: %s", ex)
             if ex.partial is not None:
                 return ex.partial
-            return b""
+            # If no partial data and incomplete read, connection is likely lost
+            await self.close()
+            raise BenQConnectionError("Connection lost: Incomplete read with no data") from ex
         except (ConnectionError, TimeoutError) as ex:
+            logger.debug("Connection error: %s", ex.strerror)
             await self.close()
             raise BenQConnectionError(ex.strerror) from ex
         except OSError as ex:
             if ex.errno in [64, 113]:
+                logger.debug("OSError %d: %s", ex.errno, ex.strerror)
                 await self.close()
                 raise BenQConnectionError(ex.strerror) from ex
             logger.exception("Unhandeled OSError")
