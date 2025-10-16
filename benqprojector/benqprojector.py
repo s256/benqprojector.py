@@ -122,6 +122,8 @@ class BenQProjector(ABC):
     _poweron_time = None
     _poweroff_time = None
     _power_timestamp = None
+    _last_disconnect_time = None  # Track when we last disconnected
+    _reconnect_delay = 20.0  # Minimum seconds between disconnect and reconnect
     direct_power_on = None
 
     lamp_time = None
@@ -211,10 +213,33 @@ class BenQProjector(ABC):
 
     async def _connect(self) -> bool:
         if not self.connected():
+            # Check if we need to wait before reconnecting
+            if self._last_disconnect_time is not None:
+                time_since_disconnect = time.time() - self._last_disconnect_time
+                if time_since_disconnect < self._reconnect_delay:
+                    wait_time = self._reconnect_delay - time_since_disconnect
+                    logger.debug("Waiting %.1fs before reconnect (%.1fs since last disconnect)",
+                               wait_time, time_since_disconnect)
+                    return False
+
             logger.info("Connecting to %s", self.connection)
             try:
                 if await self.connection.open():
                     logger.debug("Connected to %s", self.connection)
+                    self._last_disconnect_time = None  # Reset disconnect time on successful connection
+
+                    # Re-detect prompt state after reconnection (connection state may have changed)
+                    self.has_prompt = await self._detect_prompt()
+                    logger.debug("Reconnection prompt detection: %s", self.has_prompt)
+
+                    if self.has_prompt is False:
+                        self._separator = b"#"
+                    else:
+                        self._separator = b"\n"
+
+                    # Reset prompt waiting state for fresh connection
+                    self._has_to_wait_for_prompt = True
+
                 else:
                     logger.warning("Failed to open connection to %s", self.connection)
                     return False
@@ -224,22 +249,6 @@ class BenQProjector(ABC):
 
         return self.connected()
 
-    async def _is_connection_healthy(self) -> bool:
-        """
-        Check if the connection is healthy by testing if the reader is available and not at EOF.
-        """
-        if not self.connected():
-            return False
-
-        try:
-            # Check if the reader is at EOF (which indicates connection is lost)
-            if self.connection._reader and self.connection._reader.at_eof():
-                logger.debug("Connection unhealthy: reader at EOF")
-                return False
-            return True
-        except Exception:
-            logger.debug("Connection unhealthy: exception during health check")
-            return False
 
     async def connect(self, loop=None, interval: float = None) -> bool:
         """
@@ -381,6 +390,8 @@ class BenQProjector(ABC):
 
     async def _disconnect(self):
         await self.connection.close()
+        self._last_disconnect_time = time.time()
+        logger.debug("Disconnected at time %.1f", self._last_disconnect_time)
 
     async def disconnect(self) -> bool:
         """
@@ -516,56 +527,45 @@ class BenQProjector(ABC):
         command: BenQCommand,
         check_supported: bool = True,
         lowercase_response: bool = True,
-        retry_count: int = 5,
     ) -> str:
         """
-        Send a command to the BenQ projector with automatic reconnection on connection loss.
+        Send a command to the BenQ projector.
         """
 
         if check_supported and not self.supports_command(command.command):
             logger.warning("Command %s not supported", command.command)
             return None
 
-        for attempt in range(retry_count):
-            # Check connection health and reconnect if needed
-            if not await self._is_connection_healthy():
-                logger.debug("Connection unhealthy, closing and reconnecting on attempt %d", attempt + 1)
-                await self.connection.close()
+        if not await self._connect():
+            logger.error("Connection not available")
+            return None
 
-            if not await self._connect():
-                logger.error("Connection not available on attempt %d", attempt + 1)
-                if attempt == retry_count - 1:
-                    return None
-                await asyncio.sleep(0.3)  # Wait before retry
-                continue
+        try:
+            locked = await asyncio.wait_for(
+                self._connection_lock.acquire(), timeout=_CONNECTION_LOCK_TIMEOUT
+            )
+            if not locked:
+                raise BenQTooBusyError(command)
+        except asyncio.exceptions.TimeoutError as ex:
+            raise BenQTooBusyError(command) from ex
 
-            try:
-                locked = await asyncio.wait_for(
-                    self._connection_lock.acquire(), timeout=_CONNECTION_LOCK_TIMEOUT
-                )
-                if not locked:
-                    raise BenQTooBusyError(command)
-            except asyncio.exceptions.TimeoutError as ex:
-                raise BenQTooBusyError(command) from ex
-
-            try:
-                await self._send_raw_command(command.raw_command)
-                raw_response = await self._read_raw_response(command)
-                return self._parse_response(command, raw_response, lowercase_response)
-            except BenQProjectorError as ex:
-                ex.command = command
-                raise
-            except BenQConnectionError as ex:
-                logger.warning("Connection error on attempt %d/%d: %s",
-                              attempt + 1, retry_count, str(ex))
-                await self.connection.close()  # Ensure connection is closed
-                if attempt == retry_count - 1:
-                    logger.error("Failed to communicate after %d attempts", retry_count)
-                    return None
-                await asyncio.sleep(0.5)  # Wait before retry
-            finally:
-                if self._connection_lock.locked():
-                    self._connection_lock.release()
+        try:
+            await self._send_raw_command(command.raw_command)
+            raw_response = await self._read_raw_response(command)
+            return self._parse_response(command, raw_response, lowercase_response)
+        except BenQProjectorError as ex:
+            ex.command = command
+            raise
+        except (BenQConnectionError, BenQPromptTimeoutError) as ex:
+            logger.warning("Connection error: %s", str(ex))
+            # Track disconnect time and ensure connection is closed
+            self._last_disconnect_time = time.time()
+            logger.debug("Connection error - tracking disconnect time %.1f", self._last_disconnect_time)
+            await self.connection.close()
+            return None
+        finally:
+            if self._connection_lock.locked():
+                self._connection_lock.release()
 
         return None
 
@@ -600,10 +600,21 @@ class BenQProjector(ABC):
             self._has_to_wait_for_prompt = True
 
         start_time = datetime.now()
+        empty_response_count = 0
+        max_empty_responses = 10  # Allow some empty responses before giving up
+
         while True:
             response = await self.connection.read(100)
             response = response.strip(b"\x00")
+
             if response == b"":
+                empty_response_count += 1
+                logger.debug("Empty response in wait_for_prompt (%d/%d)", empty_response_count, max_empty_responses)
+
+                if empty_response_count >= max_empty_responses:
+                    logger.warning("Too many empty responses, connection may be lost")
+                    raise BenQPromptTimeoutError("Connection lost - too many empty responses")
+
                 await self.connection.write(b"\r")
             elif response[-1:] == b">":
                 logger.debug("Prompt detected")
@@ -616,8 +627,9 @@ class BenQProjector(ABC):
             else:
                 logger.warning("Unexpected response: %s", response)
 
-            if (datetime.now() - start_time).total_seconds() > 1:
-                raise BenQPromptTimeoutError()
+            if (datetime.now() - start_time).total_seconds() > 3:
+                logger.warning("Prompt timeout after 3 seconds")
+                raise BenQPromptTimeoutError("Prompt timeout")
 
             await asyncio.sleep(0.05)
 
@@ -643,12 +655,15 @@ class BenQProjector(ABC):
             if (datetime.now() - last_response).total_seconds() > _RESPONSE_TIMEOUT:
                 logger.warning("Timeout while waiting for response - projector may be unresponsive or connection lost")
                 self._has_to_wait_for_prompt = True
+                # Track disconnect time for delayed reconnection
+                self._last_disconnect_time = time.time()
+                logger.debug("Response timeout - tracking disconnect time %.1f", self._last_disconnect_time)
                 # Convert timeout to connection error to trigger retry logic
                 await self.connection.close()
                 raise BenQConnectionError("Response timeout - projector unresponsive")
 
             logger.debug("Waiting for response")
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(1)
 
     async def _read_raw_response(self, command: BenQCommand) -> str:
         response = None
@@ -837,8 +852,9 @@ class BenQProjector(ABC):
         """
         Update the current power state.
         """
-        logger.debug('Next attempt to check power')
+        current_time = time.time()
         response = await self.send_command(CMD_POWER)
+
         if response is None:
             # During power transitions, connection may be lost temporarily
             if self.power_status == self.POWERSTATUS_POWERINGON:
@@ -855,9 +871,16 @@ class BenQProjector(ABC):
             return False
 
         if response == "off":
+            # Check if we're in a known power-on transition
             if (
+                self.power_status == self.POWERSTATUS_POWERINGON
+                and (current_time - self._power_timestamp) <= self._poweron_time
+            ):
+                logger.debug("Projector still powering on (reporting OFF but may be booting)")
+                return True
+            elif (
                 self.power_status == self.POWERSTATUS_POWERINGOFF
-                and (time.time() - self._power_timestamp) <= self._poweroff_time
+                and (current_time - self._power_timestamp) <= self._poweroff_time
             ):
                 logger.debug("Projector still powering off")
             else:
@@ -870,14 +893,14 @@ class BenQProjector(ABC):
         if response == "on":
             if (
                 self.power_status == self.POWERSTATUS_POWERINGON
-                and (time.time() - self._power_timestamp) <= self._poweron_time
+                and (current_time - self._power_timestamp) <= self._poweron_time
             ):
-                logger.debug("Projector still powering on")
+                logger.debug("Projector finished powering on")
             else:
                 logger.debug("Projector is on")
-                self.power_status = self.POWERSTATUS_ON
-                self._power_timestamp = None
 
+            self.power_status = self.POWERSTATUS_ON
+            self._power_timestamp = None
             return True
 
         logger.error("Unknown power status: %s", response)
