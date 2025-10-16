@@ -795,7 +795,7 @@ class BenQProjector(ABC):
         response = await self.send_command(CMD_POWER)
         if response is None:
             if self.power_status == self.POWERSTATUS_POWERINGON:
-                logger.debug("Projector still powering on")
+                logger.debug("Projector still powering on 1")
                 return True
             if self.power_status == self.POWERSTATUS_POWERINGOFF:
                 logger.debug("Projector still powering off")
@@ -821,7 +821,7 @@ class BenQProjector(ABC):
                 self.power_status == self.POWERSTATUS_POWERINGON
                 and (time.time() - self._power_timestamp) <= self._poweron_time
             ):
-                logger.debug("Projector still powering on")
+                logger.debug("Projector still powering on 2")
             else:
                 self.power_status = self.POWERSTATUS_ON
                 self._power_timestamp = None
@@ -997,7 +997,7 @@ class BenQProjector(ABC):
                 self.power_status == self.POWERSTATUS_POWERINGON
                 and (time.time() - self._power_timestamp) <= self._poweron_time
             ):
-                logger.debug("Projector still powering on")
+                logger.debug("Projector still powering on 3")
             else:
                 logger.debug("Projector already on")
                 self.power_status = self.POWERSTATUS_ON
