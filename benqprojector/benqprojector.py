@@ -123,7 +123,7 @@ class BenQProjector(ABC):
     _poweroff_time = None
     _power_timestamp = None
     _last_disconnect_time = None  # Track when we last disconnected
-    _reconnect_delay = 20.0  # Minimum seconds between disconnect and reconnect
+    _reconnect_delay = 2.0  # Minimum seconds between disconnect and reconnect
     direct_power_on = None
 
     lamp_time = None
@@ -550,19 +550,23 @@ class BenQProjector(ABC):
             raise BenQTooBusyError(command) from ex
 
         try:
-            await self._send_raw_command(command.raw_command)
+            await self._send_raw_command(command.raw_command, command)
             raw_response = await self._read_raw_response(command)
             return self._parse_response(command, raw_response, lowercase_response)
-        except BenQProjectorError as ex:
-            ex.command = command
-            raise
         except (BenQConnectionError, BenQPromptTimeoutError) as ex:
-            logger.warning("Connection error: %s", str(ex))
+            logger.warning("Connection error caught in _send_command: %s", str(ex))
             # Track disconnect time and ensure connection is closed
             self._last_disconnect_time = time.time()
             logger.debug("Connection error - tracking disconnect time %.1f", self._last_disconnect_time)
             await self.connection.close()
             return None
+        except BenQProjectorError as ex:
+            ex.command = command
+            logger.debug("BenQProjectorError caught: %s", ex)
+            raise
+        except Exception as ex:
+            logger.error("Unexpected exception in _send_command: %s", ex)
+            raise
         finally:
             if self._connection_lock.locked():
                 self._connection_lock.release()
@@ -587,7 +591,7 @@ class BenQProjector(ABC):
         logger.debug("No prompt detected")
         return False
 
-    async def _wait_for_prompt(self) -> bool:
+    async def _wait_for_prompt(self, command_obj: BenQCommand = None) -> bool:
         # Clean input buffer
         await self.connection.reset()
 
@@ -613,7 +617,12 @@ class BenQProjector(ABC):
 
                 if empty_response_count >= max_empty_responses:
                     logger.warning("Too many empty responses, connection may be lost")
-                    raise BenQPromptTimeoutError("Connection lost - too many empty responses")
+                    if command_obj:
+                        raise BenQPromptTimeoutError(command_obj)
+                    else:
+                        # Create a dummy command for the exception
+                        dummy_command = BenQCommand("unknown", "?")
+                        raise BenQPromptTimeoutError(dummy_command)
 
                 await self.connection.write(b"\r")
             elif response[-1:] == b">":
@@ -629,7 +638,12 @@ class BenQProjector(ABC):
 
             if (datetime.now() - start_time).total_seconds() > 3:
                 logger.warning("Prompt timeout after 3 seconds")
-                raise BenQPromptTimeoutError("Prompt timeout")
+                if command_obj:
+                    raise BenQPromptTimeoutError(command_obj)
+                else:
+                    # Create a dummy command for the exception
+                    dummy_command = BenQCommand("unknown", "?")
+                    raise BenQPromptTimeoutError(dummy_command)
 
             await asyncio.sleep(0.05)
 
@@ -731,12 +745,12 @@ class BenQProjector(ABC):
 
             return response
 
-    async def _send_raw_command(self, command: str):
+    async def _send_raw_command(self, command: str, command_obj: BenQCommand = None):
         """
         Send a raw command to the BenQ projector.
         """
         if self.has_prompt:
-            await self._wait_for_prompt()
+            await self._wait_for_prompt(command_obj)
 
         logger.debug("command %s", command)
         await self.connection.write(f"{command}\r".encode("ascii"))
@@ -805,12 +819,16 @@ class BenQProjector(ABC):
             response = await self._send_command(
                 BenQCommand(command, action), check_supported
             )
-        except BenQConnectionError:
+        except BenQConnectionError as ex:
             # Connection errors are now handled in _send_command with retries
-            logger.debug("Connection error handled by retry logic")
+            logger.debug("BenQConnectionError caught in send_command: %s", ex)
             await self.connection.close()
-        except BenQProjectorError:
+        except BenQProjectorError as ex:
+            logger.debug("BenQProjectorError caught in send_command: %s", ex)
             pass
+        except Exception as ex:
+            logger.error("Unexpected exception in send_command: %s", ex)
+            raise
 
         return response
 
@@ -832,7 +850,7 @@ class BenQProjector(ABC):
         raw_response = None
 
         try:
-            await self._send_raw_command(command.raw_command)
+            await self._send_raw_command(command.raw_command, command)
 
             # Read and log the response
             raw_response = await self._read_raw_response(command)
