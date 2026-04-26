@@ -542,6 +542,9 @@ class BenQProjector(ABC):
             except (BrokenPipeError, ConnectionResetError, BenQConnectionError):
                 logger.error("Error communicating with BenQ projector")
                 await self._disconnect()
+            except Exception:
+                logger.exception("Unexpected error in read coroutine")
+                await self._disconnect()
 
         self._read_task = None
         logger.debug("Read coroutine stopped")
