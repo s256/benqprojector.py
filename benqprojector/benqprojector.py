@@ -929,15 +929,20 @@ class BenQProjector(ABC):
                     logger.debug("Projector still powering off")
                 return True
 
-            # Tolerate transient failures — only go UNKNOWN after 3
-            # consecutive None responses to avoid flapping during boot.
+            # After 3 consecutive failures, force a connection reset.
+            # The TCP socket may still be open but the serial bridge's
+            # protocol state is likely corrupt. Closing forces a fresh
+            # TCP handshake + serial re-sync on the next poll cycle.
             if self._power_failure_count >= 3:
                 logger.warning(
-                    "Power query failed %d times, setting status to UNKNOWN",
+                    "Power query failed %d times, resetting connection",
                     self._power_failure_count,
                 )
-                self.power_status = self.POWERSTATUS_UNKNOWN
-                return False
+                await self.connection.close()
+                self._power_failure_count = 0
+                # Keep current power_status — don't go UNKNOWN.
+                # The reconnect on the next cycle will get a fresh state.
+                return True
 
             logger.debug("Power query failed, keeping current status %d", self.power_status)
             return True
