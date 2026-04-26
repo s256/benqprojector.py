@@ -21,6 +21,9 @@ to network bridges such as [esp-link](https://github.com/jeelabs/esp-link).
 * Reading the projector status
 * Detect projector capabilities
 * Uses asynchronous IO
+* Command tiering — polls frequently changing state more often than static settings
+* User command priority — user-initiated actions preempt background polling
+* Configurable inter-command delay — prevents serial link saturation
 
 ## Protocol
 
@@ -68,6 +71,61 @@ Example of a serial to WiFi bridge using a serial to TTL converter and a Wemos C
 It has to be said that a direct serial connection to the projector is much more responsive than
 using a serial to WiFi bridge. Maybe this is different on an integrated networked BenQ projector or
 using ethernet instead of WiFi.
+
+## Polling and command management
+
+When the library connects with a polling interval, it runs a background loop that queries the
+projector for status updates. To avoid saturating the serial link — especially over network bridges
+— commands are organized into tiers that control how often each is polled.
+
+### Command tiers
+
+| Tier | Poll frequency | Default commands | Description |
+|------|----------------|------------------|-------------|
+| **Hot** | Every cycle | `pow` | Power state is always checked |
+| **Active** | Every cycle (when on) | `vol`, `mute`, `sour` | Frequently changing state |
+| **Warm** | Every 3rd cycle | `appmod`, `asp`, `lampm`, `ct`, `blank`, `freeze`, `audiosour`, `3d` | User-changeable settings |
+| **Cold** | Every 6th cycle | Everything else | Rarely changing configuration |
+| **Once** | Every 60th cycle | `ltim`, `ltim2` | Lamp hours, changes extremely slowly |
+
+With a 5 second polling interval, warm commands are refreshed every ~15 seconds, cold commands every
+~30 seconds, and lamp time every ~5 minutes.
+
+Tier assignments can be customized per projector model via the JSON configuration files. See the
+`configs/` directory for examples. A model config can include a `command_tiers` key:
+
+```json
+{
+    "command_tiers": {
+        "warm": ["appmod", "asp", "lampm", "ct", "blank"],
+        "cold": ["pp", "directpower", "highaltitude"],
+        "once": []
+    }
+}
+```
+
+Commands not assigned to any tier default to cold.
+
+### Inter-command delay
+
+A configurable delay is inserted between each command sent during polling to give the projector's
+serial processor time to recover. The default is 100 ms. This can be set per model in the JSON
+configuration via the `inter_command_delay` key (in seconds):
+
+```json
+{
+    "inter_command_delay": 0.1
+}
+```
+
+Increase this value if you experience dropped commands or connection resets, especially when using
+serial-to-network bridges.
+
+### User command priority
+
+When a user sends a command (power on/off, source change, volume adjustment, etc.), the background
+polling loop automatically yields to let the user command through. This prevents the common issue
+where turn-off commands fail because the polling loop is holding the serial connection.
 
 ## Supported projectors
 

@@ -52,7 +52,21 @@ WHITESPACE = string.whitespace + "\x00"
 END_OF_RESPONSE = b"#\n\r\x00"
 
 _RESPONSE_TIMEOUT = 5.0
-_CONNECTION_LOCK_TIMEOUT = 1
+_CONNECTION_LOCK_TIMEOUT = 3
+
+_DEFAULT_INTER_COMMAND_DELAY = 0.1
+
+DEFAULT_COMMAND_TIERS = {
+    "warm": ["appmod", "asp", "lampm", "ct", "blank", "freeze", "audiosour", "3d"],
+    "cold": [],
+    "once": ["ltim", "ltim2"],
+}
+
+_TIER_INTERVALS = {
+    "warm": 3,
+    "cold": 6,
+    "once": 60,
+}
 
 CMD_MODELNAME = "modelname"
 CMD_POWER = "pow"
@@ -163,6 +177,11 @@ class BenQProjector(ABC):
         self._connection_lock = asyncio.Lock()
         self._listeners = []
         self._listener_commands = []
+
+        self._inter_command_delay = _DEFAULT_INTER_COMMAND_DELAY
+        self._poll_cycle = 0
+        self._command_tiers: dict[str, str] = {}
+        self._user_command_event = asyncio.Event()
 
     def busy(self):
         """
@@ -324,6 +343,23 @@ class BenQProjector(ABC):
         self._poweron_time = await self.get_config("poweron_time")
         self._poweroff_time = await self.get_config("poweroff_time")
 
+        inter_command_delay = await self.get_config("inter_command_delay")
+        if inter_command_delay is not None:
+            self._inter_command_delay = inter_command_delay
+
+        tier_config = await self.get_config("command_tiers")
+        merged_tiers = {
+            tier: list(cmds) for tier, cmds in DEFAULT_COMMAND_TIERS.items()
+        }
+        if tier_config:
+            for tier_name in ("warm", "cold", "once"):
+                if tier_name in tier_config:
+                    merged_tiers[tier_name] = tier_config[tier_name]
+        self._command_tiers = {}
+        for tier_name, commands in merged_tiers.items():
+            for cmd in commands:
+                self._command_tiers[cmd] = tier_name
+
         mac = None
         if self.supports_command("macaddr"):
             mac = await self.send_command("macaddr")
@@ -398,6 +434,17 @@ class BenQProjector(ABC):
 
         return True
 
+    def _should_poll_command(self, command: str) -> bool:
+        """Check if a command should be polled this cycle based on its tier."""
+        tier = self._command_tiers.get(command)
+        if tier is None:
+            # Commands not in any tier are COLD by default
+            tier = "cold"
+        interval = _TIER_INTERVALS.get(tier)
+        if interval is None:
+            return True
+        return self._poll_cycle % interval == 0
+
     async def _read_coroutine(self):
         """
         Reads the current status of the projector in a loop
@@ -406,6 +453,8 @@ class BenQProjector(ABC):
 
         while True:
             try:
+                self._poll_cycle += 1
+
                 if not self.connected():
                     await self._connect()
 
@@ -416,8 +465,13 @@ class BenQProjector(ABC):
                         if previous_data.get(CMD_POWER) != self.power_status:
                             self._forward_to_listeners(CMD_POWER, self.power_status)
                             previous_data[CMD_POWER] = self.power_status
+                        await asyncio.sleep(self._inter_command_delay)
 
                         if self.power_status == self.POWERSTATUS_ON:
+                            if self._user_command_event.is_set():
+                                await asyncio.sleep(self._interval)
+                                continue
+
                             await self.update_volume()
                             if previous_data.get(CMD_MUTE) != self.muted:
                                 self._forward_to_listeners(CMD_MUTE, self.muted)
@@ -425,6 +479,11 @@ class BenQProjector(ABC):
                             if previous_data.get(CMD_VOLUME) != self.volume:
                                 self._forward_to_listeners(CMD_VOLUME, self.volume)
                                 previous_data[CMD_VOLUME] = self.volume
+                            await asyncio.sleep(self._inter_command_delay)
+
+                            if self._user_command_event.is_set():
+                                await asyncio.sleep(self._interval)
+                                continue
 
                             await self.update_video_source()
                             if previous_data.get(CMD_SOURCE) != self.video_source:
@@ -432,14 +491,21 @@ class BenQProjector(ABC):
                                     CMD_SOURCE, self.video_source
                                 )
                                 previous_data[CMD_SOURCE] = self.video_source
+                            await asyncio.sleep(self._inter_command_delay)
 
                             for command in self._listener_commands:
+                                if self._user_command_event.is_set():
+                                    break
+
                                 if command not in [
                                     CMD_POWER,
                                     CMD_MUTE,
                                     CMD_VOLUME,
                                     CMD_SOURCE,
                                 ]:
+                                    if not self._should_poll_command(command):
+                                        continue
+
                                     data = await self.send_command(command)
                                     if (
                                         data is not None
@@ -447,6 +513,7 @@ class BenQProjector(ABC):
                                     ):
                                         self._forward_to_listeners(command, data)
                                         previous_data[command] = data
+                                    await asyncio.sleep(self._inter_command_delay)
                         else:
                             for command in ["pp", "ltim", "ltim2"]:
                                 if (
@@ -460,6 +527,7 @@ class BenQProjector(ABC):
                                     ):
                                         self._forward_to_listeners(command, data)
                                         previous_data[command] = data
+                                    await asyncio.sleep(self._inter_command_delay)
                     elif (
                         self.power_status == self.POWERSTATUS_UNKNOWN
                         and previous_data.get(CMD_POWER) != self.power_status
@@ -736,13 +804,21 @@ class BenQProjector(ABC):
         return response
 
     async def send_command(
-        self, command: str, action: str = "?", check_supported: bool = True
+        self,
+        command: str,
+        action: str = "?",
+        check_supported: bool = True,
+        priority: bool = False,
     ) -> str:
         """
         Send a command to the BenQ projector.
+
+        Set priority=True for user-initiated commands to preempt background polling.
         """
         response = None
 
+        if priority:
+            self._user_command_event.set()
         try:
             response = await self._send_command(
                 BenQCommand(command, action), check_supported
@@ -751,6 +827,9 @@ class BenQProjector(ABC):
             await self.connection.close()
         except BenQProjectorError:
             pass
+        finally:
+            if priority:
+                self._user_command_event.clear()
 
         return response
 
@@ -760,6 +839,7 @@ class BenQProjector(ABC):
         """
         command = BenQRawCommand(raw_command)
 
+        self._user_command_event.set()
         try:
             locked = await asyncio.wait_for(
                 self._connection_lock.acquire(), timeout=_CONNECTION_LOCK_TIMEOUT
@@ -767,6 +847,7 @@ class BenQProjector(ABC):
             if not locked:
                 raise BenQTooBusyError(command)
         except asyncio.exceptions.TimeoutError as ex:
+            self._user_command_event.clear()
             raise BenQTooBusyError(command) from ex
 
         raw_response = None
@@ -788,6 +869,7 @@ class BenQProjector(ABC):
             return None
         finally:
             self._connection_lock.release()
+            self._user_command_event.clear()
 
         return raw_response
 
@@ -979,6 +1061,13 @@ class BenQProjector(ABC):
 
         First it tests if the projector is in a state that powering on is possible.
         """
+        self._user_command_event.set()
+        try:
+            return await self._turn_on()
+        finally:
+            self._user_command_event.clear()
+
+    async def _turn_on(self) -> bool:
         # Check the actual power state of the projector.
         response = None
         try:
@@ -1046,6 +1135,13 @@ class BenQProjector(ABC):
 
         First it tests if the projector is in a state that powering off is possible.
         """
+        self._user_command_event.set()
+        try:
+            return await self._turn_off()
+        finally:
+            self._user_command_event.clear()
+
+    async def _turn_off(self) -> bool:
         # Check the actual power state of the projector.
         response = None
         try:
@@ -1111,7 +1207,7 @@ class BenQProjector(ABC):
         """
         Mutes the volume.
         """
-        response = await self.send_command(CMD_MUTE, ACTION_ON)
+        response = await self.send_command(CMD_MUTE, ACTION_ON, priority=True)
         if response == "on":
             self.muted = True
             return True
@@ -1122,7 +1218,7 @@ class BenQProjector(ABC):
         """
         Unmutes the volume.
         """
-        response = await self.send_command(CMD_MUTE, ACTION_OFF)
+        response = await self.send_command(CMD_MUTE, ACTION_OFF, priority=True)
         if response == "off":
             self.muted = False
             return True
@@ -1138,7 +1234,7 @@ class BenQProjector(ABC):
         elif self.volume >= 20:  # Can't go higher than 20
             return False
 
-        if await self.send_command(CMD_VOLUME, "+") == "+":
+        if await self.send_command(CMD_VOLUME, "+", priority=True) == "+":
             self.volume += 1
             return True
 
@@ -1153,7 +1249,7 @@ class BenQProjector(ABC):
         elif self.volume <= 0:  # Can't go lower than 0
             return False
 
-        if await self.send_command(CMD_VOLUME, "-") == "-":
+        if await self.send_command(CMD_VOLUME, "-", priority=True) == "-":
             self.volume -= 1
             return True
 
@@ -1166,27 +1262,31 @@ class BenQProjector(ABC):
         if self.volume == level:
             return True
 
-        if not self._use_volume_increments:
-            # Try to set the volume without increments, some projectors seem to support this
-            try:
-                if await self._send_command(BenQCommand(CMD_VOLUME, level)) == str(
-                    level
-                ):
-                    logger.debug("Successfully set volume withouth increments")
-                    return True
-            except BenQUnsupportedItemError:
-                logger.debug("Need increments to set volume")
-                self._use_volume_increments = True
+        self._user_command_event.set()
+        try:
+            if not self._use_volume_increments:
+                # Try to set the volume without increments, some projectors seem to support this
+                try:
+                    if await self._send_command(BenQCommand(CMD_VOLUME, level)) == str(
+                        level
+                    ):
+                        logger.debug("Successfully set volume withouth increments")
+                        return True
+                except BenQUnsupportedItemError:
+                    logger.debug("Need increments to set volume")
+                    self._use_volume_increments = True
 
-        while self.volume < level:
-            if not await self.volume_up():
-                return False
+            while self.volume < level:
+                if not await self.volume_up():
+                    return False
 
-        while self.volume > level:
-            if not await self.volume_down():
-                return False
+            while self.volume > level:
+                if not await self.volume_down():
+                    return False
 
-        return True
+            return True
+        finally:
+            self._user_command_event.clear()
 
     async def select_video_source(self, video_source: str):
         """
@@ -1197,7 +1297,7 @@ class BenQProjector(ABC):
         if video_source not in self.video_sources:
             return False
 
-        if await self.send_command(CMD_SOURCE, video_source) == video_source:
+        if await self.send_command(CMD_SOURCE, video_source, priority=True) == video_source:
             self.video_source = video_source
             return True
 

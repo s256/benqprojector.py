@@ -214,5 +214,6 @@
 		"nvidia"
 	],
 	"poweron_time": 100,
-	"poweroff_time": 100
+	"poweroff_time": 100,
+	"inter_command_delay": 0.1
 }
