@@ -894,6 +894,12 @@ class BenQProjector(ABC):
         """
         response = await self.send_command(CMD_POWER)
         if response is None:
+            self._power_failure_count = getattr(self, "_power_failure_count", 0) + 1
+            logger.debug(
+                "Power query returned None (failure %d, status %d)",
+                self._power_failure_count,
+                self.power_status,
+            )
             if self.power_status == self.POWERSTATUS_POWERINGON:
                 if (
                     self._power_timestamp is not None
@@ -923,8 +929,21 @@ class BenQProjector(ABC):
                     logger.debug("Projector still powering off")
                 return True
 
-            self.power_status = self.POWERSTATUS_UNKNOWN
-            return False
+            # Tolerate transient failures — only go UNKNOWN after 3
+            # consecutive None responses to avoid flapping during boot.
+            if self._power_failure_count >= 3:
+                logger.warning(
+                    "Power query failed %d times, setting status to UNKNOWN",
+                    self._power_failure_count,
+                )
+                self.power_status = self.POWERSTATUS_UNKNOWN
+                return False
+
+            logger.debug("Power query failed, keeping current status %d", self.power_status)
+            return True
+
+        # Got a valid response — reset failure counter.
+        self._power_failure_count = 0
 
         if response == "off":
             if (
