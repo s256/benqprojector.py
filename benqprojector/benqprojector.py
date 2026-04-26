@@ -454,6 +454,13 @@ class BenQProjector(ABC):
         while True:
             try:
                 self._poll_cycle += 1
+                logger.debug(
+                    "Poll cycle %d: connected=%s busy=%s power=%s",
+                    self._poll_cycle,
+                    self.connected(),
+                    self.busy(),
+                    self.power_status,
+                )
 
                 if not self.connected():
                     await self._connect()
@@ -514,7 +521,9 @@ class BenQProjector(ABC):
                                         self._forward_to_listeners(command, data)
                                         previous_data[command] = data
                                     await asyncio.sleep(self._inter_command_delay)
-                        else:
+                        elif self.power_status == self.POWERSTATUS_OFF:
+                            # Only poll static info when projector is
+                            # fully off and we haven't fetched it yet.
                             for command in ["pp", "ltim", "ltim2"]:
                                 if (
                                     command in self._listener_commands
@@ -528,6 +537,9 @@ class BenQProjector(ABC):
                                         self._forward_to_listeners(command, data)
                                         previous_data[command] = data
                                     await asyncio.sleep(self._inter_command_delay)
+                        # POWERINGON / POWERINGOFF: only poll power,
+                        # skip everything else to avoid 5s timeouts
+                        # that block the loop.
                     elif (
                         self.power_status == self.POWERSTATUS_UNKNOWN
                         and previous_data.get(CMD_POWER) != self.power_status
