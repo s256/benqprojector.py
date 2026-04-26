@@ -880,10 +880,32 @@ class BenQProjector(ABC):
         response = await self.send_command(CMD_POWER)
         if response is None:
             if self.power_status == self.POWERSTATUS_POWERINGON:
-                logger.debug("Projector still powering on")
+                if (
+                    self._power_timestamp is not None
+                    and self._poweron_time is not None
+                    and (time.time() - self._power_timestamp) > self._poweron_time
+                ):
+                    logger.info(
+                        "Power-on timeout exceeded with no response, assuming projector is on"
+                    )
+                    self.power_status = self.POWERSTATUS_ON
+                    self._power_timestamp = None
+                else:
+                    logger.debug("Projector still powering on")
                 return True
             if self.power_status == self.POWERSTATUS_POWERINGOFF:
-                logger.debug("Projector still powering off")
+                if (
+                    self._power_timestamp is not None
+                    and self._poweroff_time is not None
+                    and (time.time() - self._power_timestamp) > self._poweroff_time
+                ):
+                    logger.info(
+                        "Power-off timeout exceeded with no response, assuming projector is off"
+                    )
+                    self.power_status = self.POWERSTATUS_OFF
+                    self._power_timestamp = None
+                else:
+                    logger.debug("Projector still powering off")
                 return True
 
             self.power_status = self.POWERSTATUS_UNKNOWN
