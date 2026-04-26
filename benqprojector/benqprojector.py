@@ -948,9 +948,17 @@ class BenQProjector(ABC):
         if response == "off":
             if (
                 self.power_status == self.POWERSTATUS_POWERINGOFF
+                and self._power_timestamp is not None
                 and (time.time() - self._power_timestamp) <= self._poweroff_time
             ):
                 logger.debug("Projector still powering off")
+            elif (
+                self.power_status == self.POWERSTATUS_POWERINGON
+                and self._power_timestamp is not None
+                and (time.time() - self._power_timestamp) <= self._poweron_time
+            ):
+                # Projector briefly reports "off" during power-on transition.
+                logger.debug("Projector reports off but still within power-on window, ignoring")
             else:
                 self.power_status = self.POWERSTATUS_OFF
                 self._power_timestamp = None
@@ -960,9 +968,17 @@ class BenQProjector(ABC):
         if response == "on":
             if (
                 self.power_status == self.POWERSTATUS_POWERINGON
+                and self._power_timestamp is not None
                 and (time.time() - self._power_timestamp) <= self._poweron_time
             ):
                 logger.debug("Projector still powering on")
+            elif (
+                self.power_status == self.POWERSTATUS_POWERINGOFF
+                and self._power_timestamp is not None
+                and (time.time() - self._power_timestamp) <= self._poweroff_time
+            ):
+                # Projector still reports "on" right after power-off command.
+                logger.debug("Projector reports on but still within power-off window, ignoring")
             else:
                 self.power_status = self.POWERSTATUS_ON
                 self._power_timestamp = None
