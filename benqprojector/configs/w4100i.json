@@ -43,8 +43,8 @@
 	"menu_positions": ["center", "tl", "tr", "br", "bl"],
 	"lamp_modes": ["lnor", "eco", "seco"],
 	"3d_modes": ["off", "auto", "tb", "fs", "fp", "sbs", "da", "iv"],
-	"poweron_time": 14,
-	"poweroff_time": 14,
+	"poweron_time": 30,
+	"poweroff_time": 30,
 	"inter_command_delay": 0.1,
 	"command_tiers": {
 		"warm": ["appmod", "asp", "lampm", "ct", "blank"],
