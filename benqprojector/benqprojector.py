@@ -926,19 +926,19 @@ class BenQProjector(ABC):
                     logger.debug("Projector still powering on")
                 return True
             if self.power_status == self.POWERSTATUS_POWERINGOFF:
-                if (
-                    self._power_timestamp is not None
-                    and self._poweroff_time is not None
-                    and (time.time() - self._power_timestamp) > self._poweroff_time
-                ):
+                # The projector already confirmed pow=off, so we know it's
+                # shutting down.  The serial processor goes dark almost
+                # immediately — no point waiting the full poweroff_time.
+                # After 2 consecutive None responses the link is dead;
+                # assume OFF and reset the connection right away.
+                if self._power_failure_count >= 2:
                     logger.info(
-                        "Power-off timeout exceeded with no response, assuming projector is off"
+                        "Projector powering off: %d consecutive failures, "
+                        "assuming off and resetting connection",
+                        self._power_failure_count,
                     )
                     self.power_status = self.POWERSTATUS_OFF
                     self._power_timestamp = None
-                    # Serial link is dead after 30s of silence — reset now
-                    # instead of waiting for 3 more failures.
-                    logger.info("Resetting connection after power-off transition")
                     await self.connection.close()
                     self._power_failure_count = 0
                     self._has_to_wait_for_prompt = False
