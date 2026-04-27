@@ -915,6 +915,13 @@ class BenQProjector(ABC):
                     )
                     self.power_status = self.POWERSTATUS_ON
                     self._power_timestamp = None
+                    # Serial link is dead after 30s of silence — reset now
+                    # instead of waiting for 3 more failures.
+                    logger.info("Resetting connection after power-on transition")
+                    await self.connection.close()
+                    self._power_failure_count = 0
+                    self._has_to_wait_for_prompt = False
+                    self._expect_command_echo = None
                 else:
                     logger.debug("Projector still powering on")
                 return True
@@ -929,6 +936,13 @@ class BenQProjector(ABC):
                     )
                     self.power_status = self.POWERSTATUS_OFF
                     self._power_timestamp = None
+                    # Serial link is dead after 30s of silence — reset now
+                    # instead of waiting for 3 more failures.
+                    logger.info("Resetting connection after power-off transition")
+                    await self.connection.close()
+                    self._power_failure_count = 0
+                    self._has_to_wait_for_prompt = False
+                    self._expect_command_echo = None
                 else:
                     logger.debug("Projector still powering off")
                 return True
