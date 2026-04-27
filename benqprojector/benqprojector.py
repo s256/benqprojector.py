@@ -1285,8 +1285,17 @@ class BenQProjector(ABC):
             try:
                 response = await self._send_command(BenQCommand(CMD_POWER, ACTION_OFF))
                 if response == "off":
-                    self.power_status = self.POWERSTATUS_POWERINGOFF
-                    self._power_timestamp = time.time()
+                    # The projector confirmed it's shutting down. Set OFF
+                    # immediately — the serial processor goes dark right
+                    # after this, so polling in POWERINGOFF just burns
+                    # timeout cycles with no new information.
+                    logger.info("Power off confirmed, resetting connection")
+                    self.power_status = self.POWERSTATUS_OFF
+                    self._power_timestamp = None
+                    self._power_failure_count = 0
+                    await self.connection.close()
+                    self._has_to_wait_for_prompt = False
+                    self._expect_command_echo = None
 
                     return True
             except BenQBlockedItemError as ex:
