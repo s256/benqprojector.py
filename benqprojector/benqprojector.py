@@ -973,12 +973,6 @@ class BenQProjector(ABC):
 
         if response == "off":
             if (
-                self.power_status == self.POWERSTATUS_POWERINGOFF
-                and self._power_timestamp is not None
-                and (time.time() - self._power_timestamp) <= self._poweroff_time
-            ):
-                logger.debug("Projector still powering off")
-            elif (
                 self.power_status == self.POWERSTATUS_POWERINGON
                 and self._power_timestamp is not None
                 and (time.time() - self._power_timestamp) <= self._poweron_time
@@ -1285,13 +1279,15 @@ class BenQProjector(ABC):
             try:
                 response = await self._send_command(BenQCommand(CMD_POWER, ACTION_OFF))
                 if response == "off":
-                    # The projector confirmed it's shutting down. Set OFF
-                    # immediately — the serial processor goes dark right
-                    # after this, so polling in POWERINGOFF just burns
-                    # timeout cycles with no new information.
-                    logger.info("Power off confirmed, resetting connection")
-                    self.power_status = self.POWERSTATUS_OFF
-                    self._power_timestamp = None
+                    # The projector confirmed it's shutting down but may
+                    # still report "on" for several seconds while the
+                    # serial processor winds down. Use POWERINGOFF so
+                    # update_power() ignores stale "on" responses.
+                    # Close the connection now — polling a dying serial
+                    # link just burns 10s timeout cycles.
+                    logger.info("Power off confirmed, entering POWERINGOFF and resetting connection")
+                    self.power_status = self.POWERSTATUS_POWERINGOFF
+                    self._power_timestamp = time.time()
                     self._power_failure_count = 0
                     await self.connection.close()
                     self._has_to_wait_for_prompt = False
