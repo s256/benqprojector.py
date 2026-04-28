@@ -15,7 +15,7 @@ import string
 import sys
 import time
 from abc import ABC
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .benqclasses import (
@@ -472,13 +472,22 @@ class BenQProjector(ABC):
                 if not self.connected():
                     logger.debug("Not connected")
                 elif not self.busy():
-                    if await self.update_power():
+                    power_ok = await self.update_power()
+                    power_failed = getattr(self, "_power_failure_count", 0) > 0
+
+                    if power_ok:
                         if previous_data.get(CMD_POWER) != self.power_status:
                             self._forward_to_listeners(CMD_POWER, self.power_status)
                             previous_data[CMD_POWER] = self.power_status
                         await asyncio.sleep(self._inter_command_delay)
 
-                        if self.power_status == self.POWERSTATUS_ON:
+                        # If power query timed out, skip all other
+                        # commands — the connection is likely dead.
+                        if power_failed:
+                            logger.debug(
+                                "Power query failed, skipping remaining polls"
+                            )
+                        elif self.power_status == self.POWERSTATUS_ON:
                             if self._user_command_event.is_set():
                                 await asyncio.sleep(self._interval)
                                 continue
@@ -670,10 +679,11 @@ class BenQProjector(ABC):
         logger.warning("Prompt not detected")
         return False
 
-    async def _read_response(self) -> str:
+    async def _read_response(self, deadline: datetime = None) -> str:
         response = b""
-        start_time = datetime.now()
-        last_data_time = start_time
+        if deadline is None:
+            deadline = datetime.now() + timedelta(seconds=_RESPONSE_TIMEOUT)
+        last_data_time = datetime.now()
         last_log_time = None
         while True:
             _response = await self.connection.readuntil(self._separator)
@@ -690,18 +700,19 @@ class BenQProjector(ABC):
 
             now = datetime.now()
 
-            # Hard absolute timeout — partial data cannot extend this
-            elapsed = (now - start_time).total_seconds()
-            if elapsed > _RESPONSE_TIMEOUT:
+            # Hard absolute timeout — shared across the entire command
+            if now >= deadline:
+                elapsed = (now - (deadline - timedelta(seconds=_RESPONSE_TIMEOUT))).total_seconds()
                 logger.warning(
                     "Timeout while waiting for response (%.1fs elapsed)", elapsed
                 )
                 self._has_to_wait_for_prompt = True
                 raise BenQResponseTimeoutError()
 
-            # No data at all timeout
-            if (now - last_data_time).total_seconds() > _RESPONSE_TIMEOUT:
-                logger.warning("Timeout while waiting for response (no data)")
+            # No data at all for 3s — connection is dead, no point
+            # waiting the full timeout
+            if (now - last_data_time).total_seconds() > 3.0:
+                logger.warning("Timeout while waiting for response (no data for 3s)")
                 self._has_to_wait_for_prompt = True
                 raise BenQResponseTimeoutError()
 
@@ -717,6 +728,9 @@ class BenQProjector(ABC):
         empty_line_count = 0
         echo_received = None
         previous_response = None
+        # Single deadline for the entire command — getting a prompt or
+        # echo does NOT reset the clock.
+        deadline = datetime.now() + timedelta(seconds=_RESPONSE_TIMEOUT)
         while True:
             if empty_line_count > 5:
                 if self._init:
@@ -730,7 +744,7 @@ class BenQProjector(ABC):
                     response = previous_response
                 else:
                     raise BenQEmptyResponseError(command)
-            elif (response := await self._read_response()) == "":
+            elif (response := await self._read_response(deadline)) == "":
                 logger.debug("Empty line")
                 # Empty line
                 empty_line_count += 1
