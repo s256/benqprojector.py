@@ -672,7 +672,9 @@ class BenQProjector(ABC):
 
     async def _read_response(self) -> str:
         response = b""
-        last_response = datetime.now()
+        start_time = datetime.now()
+        last_data_time = start_time
+        last_log_time = None
         while True:
             _response = await self.connection.readuntil(self._separator)
             if len(_response) > 0:
@@ -684,14 +686,30 @@ class BenQProjector(ABC):
                     logger.debug("Response: %s", response)
 
                     return response
-                last_response = datetime.now()
+                last_data_time = datetime.now()
 
-            if (datetime.now() - last_response).total_seconds() > _RESPONSE_TIMEOUT:
-                logger.warning("Timeout while waiting for response")
+            now = datetime.now()
+
+            # Hard absolute timeout — partial data cannot extend this
+            elapsed = (now - start_time).total_seconds()
+            if elapsed > _RESPONSE_TIMEOUT:
+                logger.warning(
+                    "Timeout while waiting for response (%.1fs elapsed)", elapsed
+                )
                 self._has_to_wait_for_prompt = True
                 raise BenQResponseTimeoutError()
 
-            logger.debug("Waiting for response")
+            # No data at all timeout
+            if (now - last_data_time).total_seconds() > _RESPONSE_TIMEOUT:
+                logger.warning("Timeout while waiting for response (no data)")
+                self._has_to_wait_for_prompt = True
+                raise BenQResponseTimeoutError()
+
+            # Log at most once per second to reduce spam
+            if last_log_time is None or (now - last_log_time).total_seconds() >= 1.0:
+                logger.debug("Waiting for response")
+                last_log_time = now
+
             await asyncio.sleep(0.05)
 
     async def _read_raw_response(self, command: BenQCommand) -> str:
@@ -947,11 +965,14 @@ class BenQProjector(ABC):
                     logger.debug("Projector still powering off")
                 return True
 
-            # After 3 consecutive failures, force a connection reset.
+            # After consecutive failures, force a connection reset.
             # The TCP socket may still be open but the serial bridge's
             # protocol state is likely corrupt. Closing forces a fresh
             # TCP handshake + serial re-sync on the next poll cycle.
-            if self._power_failure_count >= 3:
+            # Use a lower threshold when we think the projector is ON —
+            # likely turned off via IR remote.
+            failure_threshold = 2 if self.power_status == self.POWERSTATUS_ON else 3
+            if self._power_failure_count >= failure_threshold:
                 logger.warning(
                     "Power query failed %d times, resetting connection",
                     self._power_failure_count,
