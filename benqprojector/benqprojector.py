@@ -233,9 +233,11 @@ class BenQProjector(ABC):
             logger.info("Connecting to %s", self.connection)
             if await self.connection.open():
                 logger.debug("Connected to %s", self.connection)
-                # Re-detect prompt on fresh connection so serial
-                # protocol state doesn't carry over from a stale session.
-                self.has_prompt = await self._detect_prompt()
+                # Only detect prompt on first connection or when not yet
+                # determined. Re-detecting on reconnect is unreliable —
+                # the projector may be off and not responding to \r.
+                if self.has_prompt is None:
+                    self.has_prompt = await self._detect_prompt()
                 self._has_to_wait_for_prompt = False
 
         return self.connected()
@@ -988,16 +990,16 @@ class BenQProjector(ABC):
             failure_threshold = 2 if self.power_status == self.POWERSTATUS_ON else 3
             if self._power_failure_count >= failure_threshold:
                 logger.warning(
-                    "Power query failed %d times, resetting connection",
+                    "Power query failed %d times, assuming OFF and resetting connection",
                     self._power_failure_count,
                 )
+                self.power_status = self.POWERSTATUS_OFF
+                self._power_timestamp = None
                 await self.connection.close()
                 self._power_failure_count = 0
                 # Reset serial protocol state so reconnect starts clean.
                 self._has_to_wait_for_prompt = False
                 self._expect_command_echo = None
-                # Keep current power_status — don't go UNKNOWN.
-                # The reconnect on the next cycle will get a fresh state.
                 return True
 
             logger.debug("Power query failed, keeping current status %d", self.power_status)
