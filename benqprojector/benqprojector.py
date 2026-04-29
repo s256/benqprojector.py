@@ -233,12 +233,21 @@ class BenQProjector(ABC):
             logger.info("Connecting to %s", self.connection)
             if await self.connection.open():
                 logger.debug("Connected to %s", self.connection)
-                # Only detect prompt on first connection or when not yet
-                # determined. Re-detecting on reconnect is unreliable —
-                # the projector may be off and not responding to \r.
-                if self.has_prompt is None:
-                    self.has_prompt = await self._detect_prompt()
-                self._has_to_wait_for_prompt = False
+                # Re-detect prompt on fresh connection.
+                detected = await self._detect_prompt()
+                if detected:
+                    self.has_prompt = True
+                    self._has_to_wait_for_prompt = False
+                elif self.has_prompt is None:
+                    # First connection: accept "no prompt" as truth.
+                    self.has_prompt = False
+                    self._has_to_wait_for_prompt = False
+                else:
+                    # Reconnect got no prompt (projector may be off or
+                    # bridge slow). Keep previous has_prompt value but
+                    # mark that prompt needs waiting — the next command
+                    # will use the longer wait path.
+                    self._has_to_wait_for_prompt = True
 
         return self.connected()
 
@@ -799,7 +808,12 @@ class BenQProjector(ABC):
         Send a raw command to the BenQ projector.
         """
         if self.has_prompt:
-            await self._wait_for_prompt()
+            try:
+                await self._wait_for_prompt()
+            except BenQPromptTimeoutError:
+                # Prompt not available — send command anyway.
+                # The projector may still respond even without prompt.
+                logger.debug("No prompt, sending command anyway")
 
         logger.debug("command %s", command)
         await self.connection.write(f"{command}\r".encode("ascii"))
@@ -878,6 +892,12 @@ class BenQProjector(ABC):
             )
         except BenQConnectionError:
             await self.connection.close()
+        except BenQPromptTimeoutError:
+            # Prompt state is corrupt — close so next attempt reconnects
+            # with a fresh prompt detection.
+            logger.debug("Prompt timeout, resetting connection")
+            await self.connection.close()
+            self._has_to_wait_for_prompt = False
         except BenQProjectorError:
             pass
         finally:
